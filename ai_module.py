@@ -29,7 +29,16 @@ from PIL import Image, ImageDraw, ImageFont
 
 GEMINI_API_BASE  = "https://generativelanguage.googleapis.com/v1beta"
 OPENROUTER_BASE  = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL = "google/gemini-2.0-flash-thinking-exp:free"   # Ganti sesuai akun
+OPENROUTER_MODEL = "meta-llama/llama-3.2-11b-vision-instruct:free"  # Vision-capable free model
+
+GEMINI_MODELS = {
+    "Gemini 3.1 Pro Preview":        "gemini-3.1-pro-preview",
+    "Gemini 3 Flash Preview":        "gemini-3-flash-preview",
+    "Gemini 3.1 Flash-Lite Preview": "gemini-3.1-flash-lite-preview",
+    "Gemini 2.5 Flash":              "gemini-2.5-flash",
+    "Gemini 2.5 Flash-Lite":         "gemini-2.5-flash-lite",
+    "Gemini 2.5 Pro":                "gemini-2.5-pro",
+}
 
 # Warna bounding box (B, G, R) untuk OpenCV
 BOX_COLORS = [
@@ -240,26 +249,107 @@ def detect_stains(image: Image.Image) -> tuple[Image.Image, list[dict]]:
 # ─── LLM: Analisis & Instruksi Pembersihan ───────────────────────────────────
 
 def _image_to_base64(image: Image.Image, fmt: str = "JPEG") -> str:
-    """Encode PIL Image ke base64 string."""
-    buf = BytesIO()
-    image.convert("RGB").save(buf, format=fmt, quality=85)
+    """
+    Encode PIL Image ke base64 string.
+    Auto-resize jika gambar terlalu besar agar tidak melebihi batas payload API.
+    """
+    MAX_SIDE = 1280  # px — cukup detail untuk analisis noda
+
+    # Resize jika perlu
+    w, h = image.size
+    if max(w, h) > MAX_SIDE:
+        scale = MAX_SIDE / max(w, h)
+        image = image.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    # Kompresi iteratif — pastikan < 4MB
+    for quality in [85, 70, 55, 40]:
+        buf = BytesIO()
+        image.convert("RGB").save(buf, format="JPEG", quality=quality)
+        if buf.tell() < 4 * 1024 * 1024:  # 4MB limit
+            break
+
     return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _repair_truncated_json(raw: str) -> str:
+    """
+    Coba perbaiki JSON yang terpotong di tengah karena token limit.
+    Strategi: temukan kurung kurawal pembuka, lalu tutup semua yang belum tertutup.
+    """
+    # Temukan posisi awal JSON
+    start = raw.find("{")
+    if start == -1:
+        return raw
+
+    fragment = raw[start:]
+
+    # Hitung kurung yang belum tertutup
+    depth      = 0
+    in_string  = False
+    escape     = False
+    last_valid = 0
+
+    for i, ch in enumerate(fragment):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            escape = True
+            continue
+        if ch == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                last_valid = i
+                break
+
+    # Jika JSON sudah lengkap
+    if depth == 0 and last_valid > 0:
+        return fragment[:last_valid + 1]
+
+    # JSON terpotong — coba tutup paksa
+    # Hapus trailing koma atau key yang belum selesai
+    fragment = fragment.rstrip().rstrip(",").rstrip()
+
+    # Jika sedang di dalam string yang belum ditutup
+    if in_string:
+        fragment += '"'
+
+    # Tutup array jika terbuka
+    open_arrays = fragment.count("[") - fragment.count("]")
+    fragment += "]" * max(0, open_arrays)
+
+    # Tutup semua object yang terbuka
+    open_objects = fragment.count("{") - fragment.count("}")
+    fragment += "}" * max(0, open_objects)
+
+    return fragment
 
 
 def _parse_llm_response(raw: str) -> dict[str, Any]:
     """
-    Ekstrak JSON dari respons LLM. Tangani kasus LLM menambahkan teks ekstra.
+    Ekstrak JSON dari respons LLM.
+    Mendukung: JSON bersih, JSON dalam markdown, JSON terpotong (token limit).
     """
+    if not raw or not raw.strip():
+        return _fallback_response("Respons kosong dari API.")
+
     # Hapus markdown code block jika ada
     cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
 
-    # Coba parse langsung
+    # Percobaan 1: parse langsung
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # Coba temukan JSON di dalam teks
+    # Percobaan 2: temukan JSON object di dalam teks
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         try:
@@ -267,7 +357,27 @@ def _parse_llm_response(raw: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
-    # Fallback: kembalikan error terstruktur
+    # Percobaan 3: repair JSON yang terpotong (token limit habis)
+    repaired = _repair_truncated_json(cleaned)
+    try:
+        result = json.loads(repaired)
+        # Pastikan field wajib ada
+        result.setdefault("jenis_noda",        "tidak terdeteksi")
+        result.setdefault("jenis_kain",        "tidak diketahui")
+        result.setdefault("tingkat_keparahan", "sedang")
+        result.setdefault("peringatan_bahaya", "")
+        result.setdefault("langkah_pembersihan", [])
+        result.setdefault("produk_rekomendasi",  [])
+        result.setdefault("catatan_tambahan",    "")
+        return result
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback akhir
+    return _fallback_response(f"Gagal memparse respons. Raw: {raw[:300]}")
+
+
+def _fallback_response(reason: str) -> dict[str, Any]:
     return {
         "jenis_noda":        "gagal diparse",
         "jenis_kain":        "tidak diketahui",
@@ -276,10 +386,10 @@ def _parse_llm_response(raw: str) -> dict[str, Any]:
         "langkah_pembersihan": [
             "1. Pastikan koneksi internet stabil",
             "2. Pastikan API key valid",
-            "3. Coba unggah gambar yang lebih jelas",
+            "3. Coba unggah gambar yang lebih jelas dan terang",
         ],
         "produk_rekomendasi": [],
-        "catatan_tambahan":  f"Raw response: {raw[:200]}",
+        "catatan_tambahan":   reason,
     }
 
 
@@ -325,12 +435,13 @@ def analyze_with_gemini(
             }
         ],
         "generationConfig": {
-            "temperature":     0.2,
-            "maxOutputTokens": 1024,
+            "temperature":     0.1,
+            "maxOutputTokens": 2048,
+            "responseMimeType": "application/json",
         },
     }
 
-    url = f"{GEMINI_API_BASE}/models/gemini-2.0-flash:generateContent?key={api_key}"
+    url = f"{GEMINI_API_BASE}/models/gemini-2.5-flash:generateContent?key={api_key}"
 
     try:
         resp = requests.post(url, json=payload, timeout=60)
@@ -387,8 +498,8 @@ def analyze_with_openrouter(
                 ],
             },
         ],
-        "temperature": 0.2,
-        "max_tokens":  1024,
+        "temperature": 0.1,
+        "max_tokens":  2048,
     }
 
     headers = {
