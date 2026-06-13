@@ -464,6 +464,21 @@ div[data-baseweb="select"]:focus-within > div {
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
+import hashlib
+
+def get_image_hash(image: Image.Image) -> str:
+    """Compute a quick hash of the image to detect changes."""
+    h = hashlib.md5()
+    h.update(f"{image.width}x{image.height}".encode())
+    try:
+        buf = BytesIO()
+        image.save(buf, format="JPEG")
+        h.update(buf.getvalue()[:30000])  # Hash first 30KB
+    except Exception:
+        pass
+    return h.hexdigest()
+
+
 def compress_image(image: Image.Image, max_mb: float = 10.0) -> Image.Image:
     """Resize + compress image before processing."""
     w, h = image.size
@@ -858,6 +873,14 @@ def main() -> None:
         )
         return
 
+    # Detect image change and reset session state if needed
+    img_hash = get_image_hash(image)
+    if "current_image_hash" not in st.session_state or st.session_state.current_image_hash != img_hash:
+        st.session_state.current_image_hash = img_hash
+        st.session_state.verify_result = None
+        st.session_state.analysis_result = None
+        st.session_state.has_analyzed = False
+
     st.markdown("---")
 
     # Bounding box detection
@@ -882,61 +905,62 @@ def main() -> None:
     with col_btn:
         analyze_clicked = st.button("🧹 Analisis & Dapatkan Instruksi Pembersihan")
 
-    if not analyze_clicked:
-        return
+    # Run analysis if the button is clicked
+    if analyze_clicked:
+        st.session_state.has_analyzed = True
+        
+        # ── Step 1: Verification ──
+        with st.spinner("✅ Memverifikasi gambar..."):
+            try:
+                verify_result = verify_stain(
+                    image            = image,
+                    provider         = settings["provider"],
+                    gemini_model     = settings["gemini_model"],
+                    openrouter_model = settings["openrouter_model"],
+                )
+            except (ValueError, ConnectionError, TimeoutError) as err:
+                st.error(f"❌ **Error verifikasi:** {err}")
+                return
+            except Exception:
+                verify_result = {
+                    "is_stain": True, "confidence": 0.5,
+                    "reason": "Verifikasi gagal, melanjutkan analisis.",
+                    "detected_object": "tidak diketahui",
+                }
+            st.session_state.verify_result = verify_result
 
-    # ── Step 1: Verification ──
-    with st.spinner("✅ Memverifikasi gambar..."):
-        try:
-            verify_result = verify_stain(
-                image            = image,
-                provider         = settings["provider"],
-                gemini_model     = settings["gemini_model"],
-                openrouter_model = settings["openrouter_model"],
-            )
-        except (ValueError, ConnectionError, TimeoutError) as err:
-            st.error(f"❌ **Error verifikasi:** {err}")
-            return
-        except Exception:
-            # If verification crashes, assume stain and continue
-            verify_result = {
-                "is_stain": True, "confidence": 0.5,
-                "reason": "Verifikasi gagal, melanjutkan analisis.",
-                "detected_object": "tidak diketahui",
-            }
-
-    render_verification_result(verify_result)
-
-    # If verification says NOT a stain, warn but allow user to continue
-    if not verify_result.get("is_stain", True):
-        st.warning(
-            "⚠️ AI mendeteksi bahwa gambar ini **mungkin bukan noda pada kain**. "
-            "Hasil analisis mungkin tidak akurat."
-        )
-        col_continue, _ = st.columns([1, 2])
-        with col_continue:
-            if not st.button("🔄 Lanjutkan Analisis Tetap", key="force_analyze"):
+        # ── Step 2: Full Analysis (multi-stain) ──
+        with st.spinner("🤖 AI sedang menganalisis semua noda..."):
+            try:
+                result = analyze_stain(
+                    image            = image,
+                    provider         = settings["provider"],
+                    additional_info  = settings["additional_info"],
+                    tag_image        = settings["tag_image"],
+                    gemini_model     = settings["gemini_model"],
+                    openrouter_model = settings["openrouter_model"],
+                )
+                st.session_state.analysis_result = result
+            except (ValueError, ConnectionError, TimeoutError) as err:
+                st.error(f"❌ **Error:** {err}")
+                return
+            except Exception as err:
+                st.error(f"❌ **Error tidak terduga:** {err}")
                 return
 
-    # ── Step 2: Full Analysis (multi-stain) ──
-    with st.spinner("🤖 AI sedang menganalisis semua noda..."):
-        try:
-            result = analyze_stain(
-                image            = image,
-                provider         = settings["provider"],
-                additional_info  = settings["additional_info"],
-                tag_image        = settings["tag_image"],
-                gemini_model     = settings["gemini_model"],
-                openrouter_model = settings["openrouter_model"],
-            )
-        except (ValueError, ConnectionError, TimeoutError) as err:
-            st.error(f"❌ **Error:** {err}")
-            return
-        except Exception as err:
-            st.error(f"❌ **Error tidak terduga:** {err}")
-            return
+    # Render results if we have analyzed
+    if st.session_state.has_analyzed and st.session_state.verify_result is not None:
+        render_verification_result(st.session_state.verify_result)
 
-    display_analysis_results(result)
+        # If verification says NOT a stain, show a warning banner but still show the results
+        if not st.session_state.verify_result.get("is_stain", True):
+            st.warning(
+                "⚠️ AI mendeteksi bahwa gambar ini **mungkin bukan noda pada kain**. "
+                "Hasil analisis mungkin tidak akurat."
+            )
+
+        if st.session_state.analysis_result is not None:
+            display_analysis_results(st.session_state.analysis_result)
 
 
 if __name__ == "__main__":
