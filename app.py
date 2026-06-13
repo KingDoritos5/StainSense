@@ -16,7 +16,7 @@ from PIL import Image
 load_dotenv()
 
 from ai_module import (
-    analyze_stain, detect_stains,
+    analyze_stain, detect_stains, verify_stain,
     GEMINI_MODELS, OPENROUTER_MODELS,
     GEMINI_MODEL_DEFAULT, OPENROUTER_MODEL_DEFAULT,
 )
@@ -404,6 +404,60 @@ div[data-baseweb="select"]:focus-within > div {
 
 #MainMenu, footer, header { visibility:hidden; }
 [data-testid="stToolbar"] { display:none; }
+
+/* Verification cards */
+.ss-verify-pass {
+    background: rgba(52, 211, 153, 0.06);
+    border: 1px solid rgba(52, 211, 153, 0.25);
+    border-left: 4px solid #34d399;
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+    transition: all 0.25s ease;
+}
+.ss-verify-pass h4 {
+    font-size: 0.72rem; font-weight: 700; letter-spacing: 0.12em;
+    text-transform: uppercase; color: #34d399; margin: 0 0 8px;
+}
+.ss-verify-pass p { font-size: 0.9rem; color: #a7f3d0; margin: 0; line-height: 1.6; }
+.ss-verify-fail {
+    background: rgba(239, 68, 68, 0.06);
+    border: 1px solid rgba(239, 68, 68, 0.25);
+    border-left: 4px solid #ef4444;
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+    transition: all 0.25s ease;
+}
+.ss-verify-fail h4 {
+    font-size: 0.72rem; font-weight: 700; letter-spacing: 0.12em;
+    text-transform: uppercase; color: #f87171; margin: 0 0 8px;
+}
+.ss-verify-fail p { font-size: 0.9rem; color: #fca5a5; margin: 0; line-height: 1.6; }
+.ss-stain-header {
+    background: linear-gradient(135deg, rgba(99, 102, 241, 0.08), rgba(99, 102, 241, 0.02));
+    border: 1px solid rgba(99, 102, 241, 0.2);
+    border-radius: 12px;
+    padding: 14px 20px;
+    margin: 20px 0 12px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.ss-stain-header .num {
+    width: 32px; height: 32px;
+    background: linear-gradient(135deg, #4f46e5, #3730a3);
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.85rem; font-weight: 700; color: #e0e7ff;
+    font-family: 'JetBrains Mono', monospace;
+}
+.ss-stain-header .info {
+    font-size: 0.95rem; font-weight: 600; color: #c7d2fe;
+}
+.ss-stain-header .loc {
+    font-size: 0.78rem; color: #6b7280; margin-left: auto;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -631,7 +685,7 @@ def display_image_panels(original: Image.Image, detected: Image.Image, detection
         st.markdown('<p class="ss-section-label">Gambar Asli</p>', unsafe_allow_html=True)
         st.image(original, use_container_width=True)
     with col_det:
-        st.markdown('<p class="ss-section-label">Deteksi Area Noda (OpenCV)</p>', unsafe_allow_html=True)
+        st.markdown('<p class="ss-section-label">Deteksi Area Noda</p>', unsafe_allow_html=True)
         st.image(detected, use_container_width=True)
         if detections:
             badges = "".join(
@@ -641,21 +695,55 @@ def display_image_panels(original: Image.Image, detected: Image.Image, detection
             st.markdown(badges, unsafe_allow_html=True)
 
 
-def display_analysis_results(result: dict) -> None:
-    st.markdown("---")
-    st.markdown(
-        '<p class="ss-section-label" style="font-size:0.9rem;margin-bottom:18px">'
-        '🔬 Hasil Analisis AI</p>',
-        unsafe_allow_html=True,
-    )
+def render_verification_result(verify_result: dict) -> None:
+    """Display the stain verification result as a card."""
+    is_stain = verify_result.get("is_stain", False)
+    confidence = verify_result.get("confidence", 0.0)
+    reason = verify_result.get("reason", "")
+    detected = verify_result.get("detected_object", "")
+    conf_pct = f"{confidence:.0%}"
 
-    # ── Top info row
+    if is_stain:
+        st.markdown(f"""
+        <div class="ss-verify-pass">
+            <h4>✅ Verifikasi: Noda Terdeteksi ({conf_pct})</h4>
+            <p><strong>Terdeteksi:</strong> {detected}<br>
+            <strong>Alasan:</strong> {reason}</p>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="ss-verify-fail">
+            <h4>❌ Verifikasi: Bukan Noda ({conf_pct})</h4>
+            <p><strong>Terdeteksi:</strong> {detected}<br>
+            <strong>Alasan:</strong> {reason}</p>
+        </div>""", unsafe_allow_html=True)
+
+
+def display_single_stain(stain: dict, index: int, total: int) -> None:
+    """Display analysis results for a single stain."""
+    jenis = stain.get("jenis_noda", "–")
+    lokasi = stain.get("lokasi_noda", "")
+
+    # Header for this stain (only if multiple)
+    if total > 1:
+        loc_text = f'<span class="loc">📍 {lokasi}</span>' if lokasi else ""
+        st.markdown(f"""
+        <div class="ss-stain-header">
+            <div class="num">{index}</div>
+            <div class="info">🔍 {jenis}</div>
+            {loc_text}
+        </div>""", unsafe_allow_html=True)
+
+    # Top info row
     cols = st.columns(3, gap="small")
     with cols[0]:
-        render_result_card("Jenis Noda", result.get("jenis_noda", "–"), "🔍")
+        noda_label = jenis
+        if lokasi and total == 1:
+            noda_label += f'<br><small style="color:#6B7280;font-size:0.78rem">📍 {lokasi}</small>'
+        render_result_card("Jenis Noda", noda_label, "🔍")
     with cols[1]:
-        kain_val = result.get("jenis_kain", "–")
-        komposisi = result.get("komposisi_kain", "")
+        kain_val = stain.get("jenis_kain", "–")
+        komposisi = stain.get("komposisi_kain", "")
         if komposisi:
             kain_val += f'<br><small style="color:#6B7280;font-size:0.78rem">{komposisi}</small>'
         st.markdown(f"""
@@ -664,7 +752,7 @@ def display_analysis_results(result: dict) -> None:
             <p>{kain_val}</p>
         </div>""", unsafe_allow_html=True)
     with cols[2]:
-        sev   = result.get("tingkat_keparahan", "sedang")
+        sev = stain.get("tingkat_keparahan", "sedang")
         badge = severity_badge(sev)
         st.markdown(f"""
         <div class="ss-result-card">
@@ -672,11 +760,11 @@ def display_analysis_results(result: dict) -> None:
             <p>{badge}</p>
         </div>""", unsafe_allow_html=True)
 
-    # ── Danger
-    render_danger_card(result.get("peringatan_bahaya", ""))
+    # Danger
+    render_danger_card(stain.get("peringatan_bahaya", ""))
 
-    # ── Steps
-    steps = result.get("langkah_pembersihan", [])
+    # Steps
+    steps = stain.get("langkah_pembersihan", [])
     if steps:
         st.markdown(
             '<p class="ss-section-label" style="margin-top:20px">🧼 Langkah Pembersihan</p>',
@@ -684,11 +772,11 @@ def display_analysis_results(result: dict) -> None:
         )
         render_cleaning_steps(steps)
 
-    # ── Products
-    render_products(result.get("produk_rekomendasi", []))
+    # Products
+    render_products(stain.get("produk_rekomendasi", []))
 
-    # ── Notes
-    catatan = result.get("catatan_tambahan", "")
+    # Notes
+    catatan = stain.get("catatan_tambahan", "")
     if catatan:
         st.markdown(f"""
         <div class="ss-result-card" style="border-color:#253049">
@@ -696,7 +784,45 @@ def display_analysis_results(result: dict) -> None:
             <p style="font-size:0.88rem;color:#94A3B8">{catatan}</p>
         </div>""", unsafe_allow_html=True)
 
-    # ── Raw JSON
+
+def display_analysis_results(result: dict) -> None:
+    """Display analysis results — supports multi-stain format."""
+    st.markdown("---")
+
+    stains = result.get("noda", [])
+
+    if not stains:
+        st.markdown("""
+        <div class="ss-warning-card">
+            <h4>ℹ️ Tidak Ada Noda Terdeteksi</h4>
+            <p>AI tidak menemukan noda pada gambar ini. Pastikan gambar menunjukkan
+            noda pada permukaan kain dengan jelas.</p>
+        </div>""", unsafe_allow_html=True)
+        return
+
+    total = len(stains)
+
+    # Summary header
+    if total == 1:
+        st.markdown(
+            '<p class="ss-section-label" style="font-size:0.9rem;margin-bottom:18px">'
+            '🔬 Hasil Analisis AI</p>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<p class="ss-section-label" style="font-size:0.9rem;margin-bottom:18px">'
+            f'🔬 Hasil Analisis AI — {total} Noda Terdeteksi</p>',
+            unsafe_allow_html=True,
+        )
+
+    # Render each stain
+    for i, stain in enumerate(stains):
+        display_single_stain(stain, i + 1, total)
+        if i < total - 1:
+            st.markdown('<hr style="border-color:rgba(255,255,255,0.06);margin:24px 0">', unsafe_allow_html=True)
+
+    # Raw JSON
     with st.expander("🔧 Respons JSON mentah"):
         st.json(result)
 
@@ -710,13 +836,14 @@ def main() -> None:
 
     if image is None:
         st.markdown("---")
-        c1, c2, c3 = st.columns(3, gap="large")
+        c1, c2, c3, c4 = st.columns(4, gap="medium")
         features = [
             ("📸", "Upload atau Foto", "Unggah gambar noda atau ambil foto langsung dari kamera browser"),
-            ("🏷", "Scan Tag Pakaian", "Upload foto label pakaian — AI membaca komposisi kain otomatis dari gambar"),
-            ("🤖", "Analisis AI", "Gemini atau OpenRouter mengidentifikasi noda & memberikan panduan pembersihan"),
+            ("🏷", "Scan Tag Pakaian", "Upload foto label pakaian — AI membaca komposisi kain otomatis"),
+            ("✅", "Verifikasi Noda", "AI memverifikasi apakah gambar benar menunjukkan noda pada kain"),
+            ("🤖", "Analisis Multi-Noda", "Identifikasi setiap noda berbeda & panduan pembersihan masing-masing"),
         ]
-        for col, (icon, title, desc) in zip([c1, c2, c3], features):
+        for col, (icon, title, desc) in zip([c1, c2, c3, c4], features):
             with col:
                 st.markdown(f"""
                 <div class="ss-result-card" style="text-align:center;padding:28px 20px">
@@ -758,8 +885,41 @@ def main() -> None:
     if not analyze_clicked:
         return
 
-    # Run LLM analysis
-    with st.spinner("🤖 AI sedang menganalisis..."):
+    # ── Step 1: Verification ──
+    with st.spinner("✅ Memverifikasi gambar..."):
+        try:
+            verify_result = verify_stain(
+                image            = image,
+                provider         = settings["provider"],
+                gemini_model     = settings["gemini_model"],
+                openrouter_model = settings["openrouter_model"],
+            )
+        except (ValueError, ConnectionError, TimeoutError) as err:
+            st.error(f"❌ **Error verifikasi:** {err}")
+            return
+        except Exception:
+            # If verification crashes, assume stain and continue
+            verify_result = {
+                "is_stain": True, "confidence": 0.5,
+                "reason": "Verifikasi gagal, melanjutkan analisis.",
+                "detected_object": "tidak diketahui",
+            }
+
+    render_verification_result(verify_result)
+
+    # If verification says NOT a stain, warn but allow user to continue
+    if not verify_result.get("is_stain", True):
+        st.warning(
+            "⚠️ AI mendeteksi bahwa gambar ini **mungkin bukan noda pada kain**. "
+            "Hasil analisis mungkin tidak akurat."
+        )
+        col_continue, _ = st.columns([1, 2])
+        with col_continue:
+            if not st.button("🔄 Lanjutkan Analisis Tetap", key="force_analyze"):
+                return
+
+    # ── Step 2: Full Analysis (multi-stain) ──
+    with st.spinner("🤖 AI sedang menganalisis semua noda..."):
         try:
             result = analyze_stain(
                 image            = image,
