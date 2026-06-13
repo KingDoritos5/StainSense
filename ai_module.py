@@ -52,6 +52,54 @@ BOX_COLORS = [
     (255, 100, 0),
 ]
 
+# ─── JSON Schemas for Gemini Structured Output ───────────────────────────────
+
+VERIFY_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "is_stain": {"type": "BOOLEAN"},
+        "confidence": {"type": "NUMBER"},
+        "reason": {"type": "STRING"},
+        "detected_object": {"type": "STRING"}
+    },
+    "required": ["is_stain", "confidence", "reason", "detected_object"]
+}
+
+SYSTEM_PROMPT_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "noda": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "jenis_noda": {"type": "STRING"},
+                    "lokasi_noda": {"type": "STRING"},
+                    "jenis_kain": {"type": "STRING"},
+                    "komposisi_kain": {"type": "STRING"},
+                    "tingkat_keparahan": {"type": "STRING"},
+                    "peringatan_bahaya": {"type": "STRING"},
+                    "langkah_pembersihan": {
+                        "type": "ARRAY",
+                        "items": {"type": "STRING"}
+                    },
+                    "produk_rekomendasi": {
+                        "type": "ARRAY",
+                        "items": {"type": "STRING"}
+                    },
+                    "catatan_tambahan": {"type": "STRING"}
+                },
+                "required": [
+                    "jenis_noda", "lokasi_noda", "jenis_kain",
+                    "komposisi_kain", "tingkat_keparahan", "peringatan_bahaya",
+                    "langkah_pembersihan", "produk_rekomendasi", "catatan_tambahan"
+                ]
+            }
+        }
+    },
+    "required": ["noda"]
+}
+
 # ─── System Prompts ───────────────────────────────────────────────────────────
 
 VERIFY_PROMPT = """Kamu adalah StainSense AI, validator noda kain.
@@ -261,20 +309,70 @@ def _normalize_result(parsed: dict[str, Any]) -> dict[str, Any]:
         "catatan_tambahan":   "",
     }
 
-    # Already in multi-stain format
-    if "noda" in parsed and isinstance(parsed["noda"], list):
-        for stain in parsed["noda"]:
-            for k, v in stain_defaults.items():
-                stain.setdefault(k, v)
-        return parsed
+    # Key mapping from English/translated keys to standard Indonesian keys
+    key_mapping = {
+        "stain_type": "jenis_noda",
+        "jenis_noda": "jenis_noda",
+        "stain_location": "lokasi_noda",
+        "lokasi_noda": "lokasi_noda",
+        "fabric_type": "jenis_kain",
+        "jenis_kain": "jenis_kain",
+        "fabric_composition": "komposisi_kain",
+        "komposisi_kain": "komposisi_kain",
+        "severity": "tingkat_keparahan",
+        "tingkat_keparahan": "tingkat_keparahan",
+        "danger_warning": "peringatan_bahaya",
+        "peringatan_bahaya": "peringatan_bahaya",
+        "cleaning_steps": "langkah_pembersihan",
+        "langkah_pembersihan": "langkah_pembersihan",
+        "recommended_products": "produk_rekomendasi",
+        "produk_rekomendasi": "produk_rekomendasi",
+        "additional_notes": "catatan_tambahan",
+        "catatan_tambahan": "catatan_tambahan",
+    }
 
-    # Legacy single-stain format → wrap in {"noda": [...]}
-    if "jenis_noda" in parsed:
+    def clean_stain_dict(stain: dict[str, Any]) -> dict[str, Any]:
+        cleaned = {}
+        for original_k, v in stain.items():
+            matched = False
+            for map_k, target_k in key_mapping.items():
+                if original_k.lower().strip() == map_k:
+                    cleaned[target_k] = v
+                    matched = True
+                    break
+            if not matched:
+                cleaned[original_k] = v
+        
         for k, v in stain_defaults.items():
-            parsed.setdefault(k, v)
-        return {"noda": [parsed]}
+            cleaned.setdefault(k, v)
+        return cleaned
 
-    # Unknown format → return as-is with defaults
+    noda_key = None
+    for k in ["noda", "stains", "stain_list"]:
+        for pk in parsed:
+            if pk.lower().strip() == k:
+                noda_key = pk
+                break
+        if noda_key:
+            break
+
+    if noda_key and isinstance(parsed[noda_key], list):
+        cleaned_stains = [clean_stain_dict(stain) for stain in parsed[noda_key] if isinstance(stain, dict)]
+        return {"noda": cleaned_stains}
+
+    if isinstance(parsed, list):
+        cleaned_stains = [clean_stain_dict(stain) for stain in parsed if isinstance(stain, dict)]
+        return {"noda": cleaned_stains}
+
+    has_stain_keys = False
+    for pk in parsed:
+        if pk.lower().strip() in key_mapping:
+            has_stain_keys = True
+            break
+
+    if has_stain_keys:
+        return {"noda": [clean_stain_dict(parsed)]}
+
     for k, v in stain_defaults.items():
         parsed.setdefault(k, v)
     return {"noda": [parsed]}
@@ -297,22 +395,72 @@ def _parse_verify_response(raw: str) -> dict[str, Any]:
 
     cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
 
+    parsed = None
     for attempt in [cleaned, None]:
         try:
             if attempt is not None:
-                result = json.loads(attempt)
+                parsed = json.loads(attempt)
             else:
                 match = re.search(r"\{.*\}", cleaned, re.DOTALL)
                 if not match:
                     break
-                result = json.loads(match.group())
-            for k, v in defaults.items():
-                result.setdefault(k, v)
-            return result
+                parsed = json.loads(match.group())
+            break
         except json.JSONDecodeError:
             continue
 
-    return defaults
+    if parsed is None or not isinstance(parsed, dict):
+        return defaults
+
+    normalized = {}
+    
+    is_stain_keys = ["is_stain", "isstain", "apakah_noda", "noda", "is_stains", "stain", "apakah_ada_noda"]
+    for k in is_stain_keys:
+        for pk in parsed:
+            if pk.lower().strip() == k:
+                val = parsed[pk]
+                if isinstance(val, str):
+                    normalized["is_stain"] = val.lower().strip() in ["true", "ya", "yes", "noda", "1"]
+                else:
+                    normalized["is_stain"] = bool(val)
+                break
+        if "is_stain" in normalized:
+            break
+            
+    conf_keys = ["confidence", "confidence_level", "tingkat_kepercayaan", "kepercayaan", "conf", "score", "akurasi"]
+    for k in conf_keys:
+        for pk in parsed:
+            if pk.lower().strip() == k:
+                try:
+                    normalized["confidence"] = float(parsed[pk])
+                except (ValueError, TypeError):
+                    pass
+                break
+        if "confidence" in normalized:
+            break
+
+    reason_keys = ["reason", "alasan", "penjelasan", "explanation", "deskripsi", "keterangan"]
+    for k in reason_keys:
+        for pk in parsed:
+            if pk.lower().strip() == k:
+                normalized["reason"] = str(parsed[pk])
+                break
+        if "reason" in normalized:
+            break
+
+    obj_keys = ["detected_object", "detectedobject", "objek_terdeteksi", "objek", "object", "terdeteksi", "objek_noda"]
+    for k in obj_keys:
+        for pk in parsed:
+            if pk.lower().strip() == k:
+                normalized["detected_object"] = str(parsed[pk])
+                break
+        if "detected_object" in normalized:
+            break
+
+    for k, v in defaults.items():
+        normalized.setdefault(k, v)
+
+    return normalized
 
 
 def _fallback(reason: str) -> dict[str, Any]:
@@ -415,20 +563,20 @@ def detect_stains(
         x, y, bw, bh = cv2.boundingRect(cnt)
         bbox_area = bw * bh
 
-        # ── Filter 1: Skip if bounding box covers > 55% of image ──
-        if bbox_area > 0.55 * w * h:
+        # ── Filter 1: Skip if bounding box covers > 85% of image ──
+        if bbox_area > 0.85 * w * h:
             continue
 
-        # ── Filter 2: Aspect ratio — reject very elongated shapes ──
+        # ── Filter 2: Aspect ratio — reject extremely elongated shapes (like borders/seams) ──
         aspect = max(bw, bh) / max(min(bw, bh), 1)
-        if aspect > 6.0:
+        if aspect > 10.0:
             continue
 
-        # ── Filter 3: Solidity — noda = blob padat, pola kain = berlubang ──
+        # ── Filter 3: Solidity — noda = blob padat, pola kain = berlubang/tersebar ──
         hull = cv2.convexHull(cnt)
         hull_area = cv2.contourArea(hull)
         solidity = area / max(hull_area, 1)
-        if solidity < 0.35:
+        if solidity < 0.20:
             continue
 
         # ── Filter 4: Local contrast check ──
@@ -444,26 +592,26 @@ def detect_stains(
         outer_pixels = np.count_nonzero(outer_region > 0)
         outer_sum = np.sum(outer_region)
         outer_mean = outer_sum / max(outer_pixels, 1) if outer_pixels > 0 else 0
-        if inner_mean < max(outer_mean * 1.5, 10):
+        if inner_mean < max(outer_mean * 1.2, 5):
             continue
 
-        # ── Filter 5: Edge density — tolak objek solid ──
+        # ── Filter 5: Edge density — tolak objek solid dengan tepi sangat tegas ──
         # Noda meresap di kain → tepian lembut, RENDAH edge density.
-        # Objek solid (gelas, piring, botol) → tepian tajam, TINGGI edge density.
+        # Objek solid/tekstur kaku → TINGGI edge density.
         roi_edges = edges[y:y+bh, x:x+bw]
         edge_pixels = np.count_nonzero(roi_edges)
         edge_density = edge_pixels / max(bbox_area, 1)
-        # Noda biasanya edge density < 0.08, objek solid > 0.10
-        if edge_density > 0.10:
+        # Noda biasanya edge density < 0.15, objek kaku > 0.22
+        if edge_density > 0.22:
             continue
 
         # ── Filter 6: Lightness variance — tolak objek 3D ──
         # Noda di kain mengikuti tekstur kain → variance L moderat.
-        # Objek 3D (gelas, cairan) punya refleksi/bayangan → variance L sangat tinggi.
+        # Objek 3D dengan refleksi cahaya tajam → variance L sangat tinggi.
         roi_l = l_ch[y:y+bh, x:x+bw]
         l_std = float(np.std(roi_l))
-        # Noda biasanya L std < 45, objek dengan refleksi > 50
-        if l_std > 50:
+        # Noda bisa mencapai L std tinggi pada kain putih (kontras tinggi). Kita batasi di 80.
+        if l_std > 80:
             continue
 
         # ── Passed all filters — draw bounding box ──
@@ -546,6 +694,7 @@ def analyze_with_gemini(
             "temperature":      0.1,
             "maxOutputTokens":  2048,
             "responseMimeType": "application/json",
+            "responseSchema":   SYSTEM_PROMPT_SCHEMA,
         },
     }
 
@@ -644,6 +793,7 @@ def _verify_with_gemini(image: Image.Image, api_key: str, model: str) -> dict[st
             "temperature": 0.1,
             "maxOutputTokens": 512,
             "responseMimeType": "application/json",
+            "responseSchema":   VERIFY_SCHEMA,
         },
     }
     url = f"{GEMINI_API_BASE}/models/{model}:generateContent?key={api_key}"
